@@ -1,0 +1,1005 @@
+From f9653b44200357c5346ded9b64ab13df12f06eb2 Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Wed, 18 Nov 2026 11:13:22 -0500
+Subject: [PATCH] ui: follow the Omarchy desktop palette
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/ui-egui/examples/snapshot.rs     |  17 +-
+ crates/ui-egui/src/app.rs               |  16 +-
+ crates/ui-egui/src/app/commands.rs      |  15 +-
+ crates/ui-egui/src/app/prefs.rs         |  31 ++-
+ crates/ui-egui/src/backstage/options.rs |   8 +-
+ crates/ui-egui/src/control.rs           |   1 +
+ crates/ui-egui/src/desktop_palette.rs   | 298 ++++++++++++++++++++++++
+ crates/ui-egui/src/lib.rs               |  32 ++-
+ crates/ui-egui/src/ribbon.rs            |   4 +-
+ crates/ui-egui/src/ribbon/view.rs       |   8 +-
+ crates/ui-egui/src/theme.rs             | 296 +++++++++++++++++++++--
+ 11 files changed, 688 insertions(+), 38 deletions(-)
+ create mode 100644 crates/ui-egui/src/desktop_palette.rs
+
+diff --git a/crates/ui-egui/examples/snapshot.rs b/crates/ui-egui/examples/snapshot.rs
+index 5474ddc84..5e32a4dbb 100644
+--- a/crates/ui-egui/examples/snapshot.rs
++++ b/crates/ui-egui/examples/snapshot.rs
+@@ -2,7 +2,10 @@
+ //!
+ //! `cargo run --release -p gridcraft-ui-egui --example snapshot -- [--sample sales] [--in file.xlsx]
+ //!  [--size 1440x900] [--scale 2] [--cmd 'id={json}']... [--tab Insert] [--dark] [--language en|es|zh|ja|ko|ru|pt|de|cs|fr|tr]
+-//!  [--pane name] [--object id] [--dialog 'name={json}'] [--refedit key=A1:B2] [--hf-edit header|footer] out.png`
++//!  [--pane name] [--object id] [--dialog 'name={json}'] [--refedit key=A1:B2] [--hf-edit header|footer]
++//!  [--desktop-palette colors.toml] out.png`
++//!
++//! `--desktop-palette` uses that file as the desktop's palette and picks the Desktop colors theme.
+ //!
+ //! `--refedit key=range` collapses the open dialog to its reference box `key`, then selects
+ //! `range` on the grid, as a person picking a range for that box does.
+@@ -20,6 +23,7 @@ fn main() {
+     let mut cmds: Vec<String> = vec![];
+     let mut tab = None;
+     let mut dark = false;
++    let mut desktop_palette: Option<String> = None;
+     let mut pane: Option<String> = None;
+     let mut chart: Option<u32> = None;
+     let mut dialog: Option<String> = None;
+@@ -59,6 +63,10 @@ fn main() {
+                 tab = args.get(i).cloned();
+             }
+             "--dark" => dark = true,
++            "--desktop-palette" => {
++                i += 1;
++                desktop_palette = args.get(i).cloned();
++            }
+             "--pane" => {
+                 i += 1;
+                 pane = args.get(i).cloned();
+@@ -115,6 +123,13 @@ fn main() {
+             {
+                 let mut app = SheetApp::new(session, Default::default());
+                 app.ui.dark = dark;
++                if let Some(path) = &desktop_palette {
++                    let palette = std::fs::read_to_string(path).ok().as_deref().and_then(gridcraft_ui_egui::desktop_palette::parse);
++                    eprintln!("desktop palette: {}", if palette.is_some() { "read" } else { "none" });
++                    app.set_desktop_palette(palette);
++                    app.ui.system_theme = true;
++                    app.ui.desktop_colors = true;
++                }
+                 if let Some(code) = &language
+                     && let Some(l) = gridcraft_ui_egui::i18n::Language::parse(code)
+                 {
+diff --git a/crates/ui-egui/src/app.rs b/crates/ui-egui/src/app.rs
+index 471905fbd..0aaa325b2 100644
+--- a/crates/ui-egui/src/app.rs
++++ b/crates/ui-egui/src/app.rs
+@@ -7,8 +7,8 @@ use super::state::{NoticeKind, OpenWindow, SaveAnswer, SheetView};
+ use super::updates_ui;
+ use super::{
+     CellRef, HashMap, INTERFACE_SCALE_MAX, INTERFACE_SCALE_MIN, Json, Notice, Perf, RangeRef, Session, SheetApp, UiRequest, UiState, backstage,
+-    clamp_interface_scale, clean_error, control, desktop_theme, dialogs, editor, floating_pictures, formula_bar, formula_locale, grid, i18n, json,
+-    keytips, macro_ui, panes, pivot_pane, printing, ribbon, tabs, text_box, theme, widgets,
++    clamp_interface_scale, clean_error, control, desktop_palette, desktop_theme, dialogs, editor, floating_pictures, formula_bar, formula_locale,
++    grid, i18n, json, keytips, macro_ui, panes, pivot_pane, printing, ribbon, tabs, text_box, theme, widgets,
+ };
+ 
+ mod clipboard;
+@@ -64,6 +64,10 @@ impl SheetApp {
+             effective_dark: false,
+             desktop_theme: desktop_theme::DesktopTheme::default(),
+             desktop_dark: None,
++            palette_watch: Default::default(),
++            wants_palette_watch: false,
++            desktop_palette: None,
++            installed_palette: None,
+             name_box: None,
+             keytips: keytips::KeyTips::default(),
+             shots: control::Shots::default(),
+@@ -122,6 +126,14 @@ impl SheetApp {
+         if let Some(answer) = self.desktop_theme.take_change() {
+             self.desktop_dark = Some(answer);
+         }
++        if self.wants_palette_watch && !self.palette_watch.watching() {
++            let repaint = ctx.clone();
++            self.palette_watch = desktop_palette::PaletteWatch::start(move || repaint.request_repaint());
++            self.wants_palette_watch = false;
++        }
++        if let Some(palette) = self.palette_watch.take_change() {
++            self.desktop_palette = palette;
++        }
+         self.sync_theme_preference(ctx);
+         self.sync_input_options(ctx);
+         // The geometry captures are bound to. Native frames recorded it from their fresh
+diff --git a/crates/ui-egui/src/app/commands.rs b/crates/ui-egui/src/app/commands.rs
+index aa0c81508..fb738c9f5 100644
+--- a/crates/ui-egui/src/app/commands.rs
++++ b/crates/ui-egui/src/app/commands.rs
+@@ -219,16 +219,27 @@ impl SheetApp {
+                 let current = if self.ui.system_theme { self.effective_dark } else { self.ui.dark };
+                 self.ui.dark = p.get("on").and_then(Json::as_bool).unwrap_or(!current);
+                 self.ui.system_theme = false;
++                self.ui.desktop_colors = false;
+                 Ok(json!({"on": self.ui.dark}))
+             }
+             "view.theme" => {
++                // `desktop`: the desktop's own colours where it publishes them (Omarchy), and
++                // the system's light or dark choice elsewhere.
+                 match p.get("mode").and_then(Json::as_str) {
+-                    Some("system") => self.ui.system_theme = true,
++                    Some("system") => {
++                        self.ui.system_theme = true;
++                        self.ui.desktop_colors = false;
++                    }
++                    Some("desktop") => {
++                        self.ui.system_theme = true;
++                        self.ui.desktop_colors = true;
++                    }
+                     Some(mode @ ("light" | "dark")) => {
+                         self.ui.dark = mode == "dark";
+                         self.ui.system_theme = false;
++                        self.ui.desktop_colors = false;
+                     }
+-                    _ => return Some(Err("theme mode must be system, light, or dark".into())),
++                    _ => return Some(Err("theme mode must be system, desktop, light, or dark".into())),
+                 }
+                 Ok(json!({"mode": self.ui.theme_mode()}))
+             }
+diff --git a/crates/ui-egui/src/app/prefs.rs b/crates/ui-egui/src/app/prefs.rs
+index 151374e6e..1b840e697 100644
+--- a/crates/ui-egui/src/app/prefs.rs
++++ b/crates/ui-egui/src/app/prefs.rs
+@@ -1,6 +1,6 @@
+ #[cfg(not(target_arch = "wasm32"))]
+ use super::updates_ui;
+-use super::{SheetApp, desktop_theme};
++use super::{SheetApp, desktop_palette, desktop_theme, theme};
+ 
+ impl SheetApp {
+     /// Runs a command and shows its error in a message box (for menu/ribbon clicks).
+@@ -8,18 +8,43 @@ impl SheetApp {
+     /// this once — tests and embedders don't start the watcher thread).
+     pub fn watch_desktop_theme(&mut self) {
+         self.desktop_theme = desktop_theme::DesktopTheme::start();
++        self.wants_palette_watch = true;
+     }
+ 
+-    /// Follows the desktop/system theme preference and records the effective theme.
++    /// Use `palette` as the desktop's palette, as the watcher would (snapshots and tests, which
++    /// don't watch the desktop).
++    pub fn set_desktop_palette(&mut self, palette: Option<desktop_palette::DesktopPalette>) {
++        self.desktop_palette = palette;
++    }
++
++    /// The desktop palette the chrome is drawn with now: "Desktop colors" is chosen and the
++    /// desktop has one.
++    pub fn active_desktop_palette(&self) -> Option<desktop_palette::DesktopPalette> {
++        self.desktop_palette.filter(|_| self.ui.desktop_colors)
++    }
++
++    /// Follows the desktop/system theme preference and records the effective theme. With a
++    /// desktop palette in use, the palette's colours are installed and its lightness decides.
+     pub(super) fn sync_theme_preference(&mut self, ctx: &egui::Context) {
++        let palette = self.active_desktop_palette();
++        if palette != self.installed_palette {
++            theme::set_desktop_tokens(ctx, palette.as_ref().map(theme::Tokens::from_desktop));
++            self.installed_palette = palette;
++            ctx.request_repaint();
++        }
+         let preference = match (
+-            self.ui.system_theme,
++            self.ui.system_theme || self.ui.desktop_colors,
+             ctx.system_theme().or_else(|| self.desktop_dark.map(|d| if d { egui::Theme::Dark } else { egui::Theme::Light })),
+         ) {
+             (true, Some(egui::Theme::Dark)) => egui::ThemePreference::Dark,
+             (true, Some(egui::Theme::Light)) => egui::ThemePreference::Light,
+             _ => self.ui.theme_preference(),
+         };
++        let preference = match palette {
++            Some(p) if p.dark => egui::ThemePreference::Dark,
++            Some(_) => egui::ThemePreference::Light,
++            None => preference,
++        };
+         if ctx.options(|o| o.theme_preference) != preference {
+             ctx.set_theme(preference);
+             ctx.request_repaint();
+diff --git a/crates/ui-egui/src/backstage/options.rs b/crates/ui-egui/src/backstage/options.rs
+index faef32a5b..68b6a5e8a 100644
+--- a/crates/ui-egui/src/backstage/options.rs
++++ b/crates/ui-egui/src/backstage/options.rs
+@@ -58,16 +58,12 @@ fn general_options(app: &mut SheetApp, ui: &mut Ui, lang: Language) {
+     egui::Grid::new("backstage_options_general").num_columns(2).spacing(vec2(18.0, 10.0)).show(ui, |ui| {
+         let label = ui.label(lang.tr("Display theme"));
+         let mode = app.ui.theme_mode();
+-        let current = match mode {
+-            "system" => "System",
+-            "dark" => "Dark",
+-            _ => "Light",
+-        };
++        let current = crate::theme_mode_label(mode);
+         craft_ui::ComboBox::from_id_salt("backstage_theme")
+             .width(160.0)
+             .selected_text(lang.tr(current))
+             .show_ui(ui, |ui| {
+-                for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")] {
++                for &(value, label) in crate::THEME_MODES {
+                     if ui.selectable_label(mode == value, lang.tr(label)).clicked() {
+                         app.run_or_alert("view.theme", json!({"mode": value}));
+                     }
+diff --git a/crates/ui-egui/src/control.rs b/crates/ui-egui/src/control.rs
+index 7d7daf006..818547089 100644
+--- a/crates/ui-egui/src/control.rs
++++ b/crates/ui-egui/src/control.rs
+@@ -311,6 +311,7 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
+             if let Some(v) = p.get("dark").and_then(Json::as_bool) {
+                 app.ui.dark = v;
+                 app.ui.system_theme = false;
++                app.ui.desktop_colors = false;
+             }
+             if let Some(v) = p.get("formulaBar").and_then(Json::as_bool) {
+                 let _ = app.run("view.formulaBar", json!({"on": v}));
+diff --git a/crates/ui-egui/src/desktop_palette.rs b/crates/ui-egui/src/desktop_palette.rs
+new file mode 100644
+index 000000000..896db74e1
+--- /dev/null
++++ b/crates/ui-egui/src/desktop_palette.rs
+@@ -0,0 +1,298 @@
++//! The desktop's own colours, for the "Desktop colors" interface theme.
++//!
++//! The XDG Desktop Portal tells applications whether to draw light or dark ([`crate::desktop_theme`]),
++//! and on some desktops an accent colour, but nothing more. Omarchy publishes no accent there: it
++//! writes the current theme's whole palette to `~/.local/state/omarchy/current/theme/colors.toml`,
++//! a flat list of `name = "#rrggbb"` lines plus `mode = "light" | "dark"`, and replaces the file
++//! when the user switches themes. This module reads that file; [`crate::theme::Tokens::from_desktop`]
++//! turns it into the interface's colours. The sheet and everything drawn on it keep their own colours.
++//!
++//! Only the colours every Omarchy theme uses the same way are read: the background and its two
++//! darker steps, the foreground and the accent. The secondary names (`lighter_background`,
++//! `dark_foreground`, …) mean different things in different themes, so the rest is derived.
++
++use std::sync::mpsc::{Receiver, TryRecvError, channel};
++use std::time::Duration;
++
++use egui::Color32;
++
++/// How often [`PaletteWatch::start`] re-reads the file. A theme switch replaces files and links,
++/// which a file watcher would have to re-arm for; reading a 1 KB file once a second is cheaper
++/// to get right and reacts soon enough.
++const POLL: Duration = Duration::from_secs(1);
++
++/// The most of the file that is read. A real palette is under 1 KB; anything past this is not one.
++const MAX_BYTES: u64 = 64 * 1024;
++
++/// The desktop's palette, as the theme file states it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct DesktopPalette {
++    /// Whether the theme is dark: its `mode`, or, without one, whether the background is darker
++    /// than the foreground.
++    pub dark: bool,
++    pub background: Color32,
++    /// One step further from the foreground than `background` (a dark theme's darker strip, a
++    /// light theme's greyer one).
++    pub dark_background: Color32,
++    /// Two steps further.
++    pub darker_background: Color32,
++    pub foreground: Color32,
++    pub accent: Color32,
++}
++
++/// The palette in a theme file's text. `None` unless it names a background, a foreground and an
++/// accent; the other colours are made from those when missing. Every line that isn't a
++/// `key = "value"` pair is skipped, so comments and tables don't matter.
++pub fn parse(text: &str) -> Option<DesktopPalette> {
++    let mut background = None;
++    let mut dark_background = None;
++    let mut darker_background = None;
++    let mut foreground = None;
++    let mut accent = None;
++    let mut mode = None;
++    for line in text.lines() {
++        let Some((key, value)) = pair(line) else { continue };
++        match key {
++            "background" => background = hex(value),
++            "dark_background" => dark_background = hex(value),
++            "darker_background" => darker_background = hex(value),
++            "foreground" => foreground = hex(value),
++            "accent" => accent = hex(value),
++            "mode" => mode = Some(value.eq_ignore_ascii_case("dark")),
++            _ => {}
++        }
++    }
++    let (background, foreground, accent) = (background?, foreground?, accent?);
++    let dark = mode.unwrap_or_else(|| luminance(background) < luminance(foreground));
++    let step = |t: f32| crate::theme::mix(background, if dark { Color32::BLACK } else { foreground }, t);
++    Some(DesktopPalette {
++        dark,
++        background,
++        dark_background: dark_background.unwrap_or_else(|| step(0.25)),
++        darker_background: darker_background.unwrap_or_else(|| step(0.45)),
++        foreground,
++        accent,
++    })
++}
++
++/// A `key = "value"` line's key and unquoted value. Values may be single- or double-quoted, or bare
++/// up to a comment.
++fn pair(line: &str) -> Option<(&str, &str)> {
++    let line = line.trim();
++    if line.starts_with('#') || line.starts_with('[') {
++        return None;
++    }
++    let (key, rest) = line.split_once('=')?;
++    let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
++    let rest = rest.trim();
++    let value = match rest.chars().next()? {
++        q @ ('"' | '\'') => rest.get(1..)?.split(q).next()?,
++        _ => rest.split(|c: char| c == '#' || c.is_whitespace()).next()?,
++    };
++    Some((key, value.trim()))
++}
++
++/// `#rrggbb`, `#rgb` or `#rrggbbaa` (alpha ignored), with or without the `#`.
++fn hex(value: &str) -> Option<Color32> {
++    let digits = value.trim().trim_start_matches('#');
++    if !digits.chars().all(|c| c.is_ascii_hexdigit()) {
++        return None;
++    }
++    let byte = |i: usize| digits.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok());
++    let nibble = |i: usize| digits.get(i..i + 1).and_then(|s| u8::from_str_radix(s, 16).ok()).map(|n| n * 17);
++    match digits.len() {
++        6 | 8 => Some(Color32::from_rgb(byte(0)?, byte(2)?, byte(4)?)),
++        3 => Some(Color32::from_rgb(nibble(0)?, nibble(1)?, nibble(2)?)),
++        _ => None,
++    }
++}
++
++use crate::theme::luminance;
++
++/// The palette the desktop shows now, or `None` when there is none (not Omarchy, or the file is
++/// missing or unreadable).
++pub fn read() -> Option<DesktopPalette> {
++    read_text().as_deref().and_then(parse)
++}
++
++/// The theme file's text, from `$XDG_STATE_HOME` when that is set and then from
++/// `~/.local/state`, where Omarchy writes it.
++#[cfg(target_os = "linux")]
++fn read_text() -> Option<String> {
++    use std::io::Read;
++    let state = std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).filter(|p| p.is_absolute());
++    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| std::path::PathBuf::from(h).join(".local/state"));
++    for dir in state.into_iter().chain(home) {
++        let Ok(file) = std::fs::File::open(dir.join("omarchy/current/theme/colors.toml")) else { continue };
++        let mut text = String::new();
++        if file.take(MAX_BYTES).read_to_string(&mut text).is_ok() {
++            return Some(text);
++        }
++    }
++    None
++}
++
++/// Omarchy is Linux only.
++#[cfg(not(target_os = "linux"))]
++fn read_text() -> Option<String> {
++    None
++}
++
++/// Watches the theme file and reports the palette when it changes.
++#[derive(Default)]
++pub struct PaletteWatch {
++    /// `None` when no watcher thread could be started.
++    changes: Option<Receiver<Option<DesktopPalette>>>,
++}
++
++impl PaletteWatch {
++    /// Start watching. The first answer is sent straight away; later ones only once two reads a
++    /// poll apart agree, so a theme switch caught halfway (the file missing or half written for
++    /// a moment) never flashes another palette. `changed` runs on the watcher's thread after each
++    /// answer (the app asks for a repaint there). Only the app binary starts this, so tests and
++    /// headless screenshots never depend on the host's theme.
++    pub fn start(changed: impl Fn() + Send + 'static) -> Self {
++        let (tx, rx) = channel();
++        let started = std::thread::Builder::new().name("gridcraft-desktop-palette".into()).spawn(move || {
++            let mut shown = read();
++            if tx.send(shown).is_err() {
++                return;
++            }
++            changed();
++            let mut previous = shown;
++            loop {
++                std::thread::sleep(POLL);
++                let now = read();
++                if now == previous && now != shown {
++                    shown = now;
++                    if tx.send(now).is_err() {
++                        return;
++                    }
++                    changed();
++                }
++                previous = now;
++            }
++        });
++        Self { changes: started.ok().map(|_| rx) }
++    }
++
++    /// Whether a watcher thread is running.
++    pub fn watching(&self) -> bool {
++        self.changes.is_some()
++    }
++
++    /// The palette if it changed since the last call (`Some(None)`: the desktop no longer has one),
++    /// polled once a frame. Several changes in one frame collapse to the newest.
++    pub fn take_change(&mut self) -> Option<Option<DesktopPalette>> {
++        let changes = self.changes.as_ref()?;
++        let mut newest = None;
++        loop {
++            match changes.try_recv() {
++                Ok(palette) => newest = Some(palette),
++                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return newest,
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const LIGHT: &str = r##"
++# A made-up light theme.
++mode = "light"
++accent = "#c06a2b"
++background = "#faf4ec"
++dark_background = "#efe6da"
++darker_background = "#e3d8ca"
++foreground = "#2b2622"
++red = "#b0302a"
++"##;
++
++    #[test]
++    fn a_theme_file_reads_as_a_palette() {
++        let p = parse(LIGHT).unwrap();
++        assert!(!p.dark);
++        assert_eq!(p.background, Color32::from_rgb(0xFA, 0xF4, 0xEC));
++        assert_eq!(p.darker_background, Color32::from_rgb(0xE3, 0xD8, 0xCA));
++        assert_eq!(p.foreground, Color32::from_rgb(0x2B, 0x26, 0x22));
++        assert_eq!(p.accent, Color32::from_rgb(0xC0, 0x6A, 0x2B));
++    }
++
++    /// Without a mode the background decides; without the background steps they are made.
++    #[test]
++    fn missing_mode_and_steps_are_derived() {
++        let p = parse("background = '#101010'\nforeground = \"#e0e0e0\"\naccent = abcdef # bare\n").unwrap();
++        assert!(p.dark);
++        assert_eq!(p.accent, Color32::from_rgb(0xAB, 0xCD, 0xEF));
++        assert!(luminance(p.dark_background) < luminance(p.background));
++        assert!(luminance(p.darker_background) < luminance(p.dark_background));
++    }
++
++    /// A file without the three colours the interface needs is no palette.
++    #[test]
++    fn an_incomplete_file_is_no_palette() {
++        assert_eq!(parse(""), None);
++        assert_eq!(parse("background = \"#fff\"\nforeground = \"#000\""), None);
++        assert_eq!(parse("background = \"#fff\"\nforeground = \"#000\"\naccent = \"blue\""), None);
++    }
++
++    /// Junk never panics: half-written lines, odd quoting, multi-byte text, wrong lengths.
++    #[test]
++    fn hostile_text_never_panics() {
++        for junk in [
++            "=",
++            "==",
++            "a=",
++            "=\"",
++            "accent = \"",
++            "accent = '#12",
++            "accent = #+12345",
++            "accent = \"#ééé\"",
++            "accent = \"#1234567\"",
++            "background = \"#\u{1F600}\u{1F600}\"",
++            "[table]\nkey",
++            "\u{0}\u{FFFF}",
++            "accent=\"#fff",
++            "mode",
++        ] {
++            let _ = parse(junk);
++        }
++        assert_eq!(hex("+12345"), None, "from_str_radix would take a sign");
++        assert_eq!(hex("#ééé"), None);
++        assert_eq!(hex("#12345"), None);
++        assert_eq!(hex("#aBc"), Some(Color32::from_rgb(0xAA, 0xBB, 0xCC)));
++        assert_eq!(hex("#11223380"), Some(Color32::from_rgb(0x11, 0x22, 0x33)));
++    }
++
++    #[test]
++    fn a_watcher_without_a_thread_is_inert() {
++        assert_eq!(PaletteWatch::default().take_change(), None);
++    }
++
++    /// "Desktop colors" is a `view.theme` mode of its own; it uses the palette only while chosen,
++    /// and the other modes turn it off.
++    #[test]
++    fn desktop_colors_follow_the_palette_when_chosen() {
++        let mut app = crate::SheetApp::new(gridcraft_engine::Session::new(), Default::default());
++        let dark = parse("mode = \"dark\"\nbackground = \"#101218\"\nforeground = \"#c8cce0\"\naccent = \"#7aa2f7\"").unwrap();
++        app.set_desktop_palette(Some(dark));
++        assert_eq!(app.active_desktop_palette(), None, "Light ignores the palette");
++        assert!(app.run("view.theme", serde_json::json!({"mode": "desktop"})).is_ok());
++        assert_eq!(app.ui.theme_mode(), "desktop");
++        assert_eq!(app.active_desktop_palette(), Some(dark));
++        assert!(app.run("view.darkMode", serde_json::json!({"on": false})).is_ok());
++        assert_eq!((app.ui.theme_mode(), app.active_desktop_palette()), ("light", None));
++        assert!(app.run("view.theme", serde_json::json!({"mode": "desktop"})).is_ok());
++        assert!(app.run("view.theme", serde_json::json!({"mode": "system"})).is_ok());
++        assert_eq!((app.ui.theme_mode(), app.active_desktop_palette()), ("system", None));
++    }
++
++    /// A new app doesn't watch the desktop's palette; the app binary starts the watcher.
++    #[test]
++    fn a_new_app_does_not_watch_the_palette() {
++        let app = crate::SheetApp::new(gridcraft_engine::Session::new(), Default::default());
++        assert!(!app.palette_watch.watching());
++    }
++}
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 3086d1fc9..2c8e8d516 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -81,6 +81,7 @@ mod state;
+ pub use clock::{monotonic_ms, now_ms};
+ pub use services::{Chrome, Inbox, Services};
+ pub use state::{NoticeKind, OpenWindow, SaveAnswer, SheetView};
++pub mod desktop_palette;
+ pub mod desktop_theme;
+ 
+ fn parse_resize_direction(value: &str) -> Option<egui::ResizeDirection> {
+@@ -97,6 +98,18 @@ fn parse_resize_direction(value: &str) -> Option<egui::ResizeDirection> {
+     }
+ }
+ 
++/// The display theme choices, as `view.theme` modes with their English labels, in menu order.
++/// Only Linux has a desktop palette to follow.
++#[cfg(target_os = "linux")]
++pub const THEME_MODES: &[(&str, &str)] = &[("system", "System"), ("desktop", "Desktop colors"), ("light", "Light"), ("dark", "Dark")];
++#[cfg(not(target_os = "linux"))]
++pub const THEME_MODES: &[(&str, &str)] = &[("system", "System"), ("light", "Light"), ("dark", "Dark")];
++
++/// The English label of a `view.theme` mode.
++pub fn theme_mode_label(mode: &str) -> &'static str {
++    THEME_MODES.iter().find(|(m, _)| *m == mode).map_or("Light", |(_, label)| label)
++}
++
+ /// Persisted UI preferences.
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+ #[serde(default, rename_all = "camelCase")]
+@@ -104,6 +117,9 @@ pub struct UiState {
+     /// The manual preference, retained when following the system appearance.
+     pub dark: bool,
+     pub system_theme: bool,
++    /// Draw the chrome in the desktop's own colours where it publishes them (Omarchy's palette,
++    /// [`desktop_palette`]); without a palette this follows the system like `system_theme`.
++    pub desktop_colors: bool,
+     pub ribbon_tab: String,
+     pub ribbon_collapsed: bool,
+     pub formula_bar_expanded: bool,
+@@ -163,6 +179,7 @@ impl Default for UiState {
+         UiState {
+             dark: false,
+             system_theme: false,
++            desktop_colors: false,
+             ribbon_tab: "Home".into(),
+             ribbon_collapsed: false,
+             formula_bar_expanded: false,
+@@ -191,7 +208,7 @@ impl UiState {
+     }
+ 
+     pub fn theme_preference(&self) -> egui::ThemePreference {
+-        if self.system_theme {
++        if self.system_theme || self.desktop_colors {
+             egui::ThemePreference::System
+         } else if self.dark {
+             egui::ThemePreference::Dark
+@@ -206,7 +223,9 @@ impl UiState {
+     }
+ 
+     pub fn theme_mode(&self) -> &'static str {
+-        if self.system_theme {
++        if self.desktop_colors {
++            "desktop"
++        } else if self.system_theme {
+             "system"
+         } else if self.dark {
+             "dark"
+@@ -287,6 +306,15 @@ pub struct SheetApp {
+     desktop_theme: desktop_theme::DesktopTheme,
+     /// The last answer [`desktop_theme`] gave, so a frame that asks costs nothing.
+     desktop_dark: Option<bool>,
++    /// The desktop's colour palette, watched while the app runs (Omarchy; "Desktop colors").
++    /// [`SheetApp::watch_desktop_theme`] asks for it; the first frame starts it, so the watcher
++    /// can wake an idle window.
++    palette_watch: desktop_palette::PaletteWatch,
++    wants_palette_watch: bool,
++    /// The last palette [`desktop_palette`] reported; `None` when the desktop has none.
++    desktop_palette: Option<desktop_palette::DesktopPalette>,
++    /// The desktop palette whose colours are installed in egui now.
++    installed_palette: Option<desktop_palette::DesktopPalette>,
+     pub name_box: Option<String>,
+     /// Transient ribbon keyboard navigation; never saved with UI preferences.
+     pub keytips: keytips::KeyTips,
+diff --git a/crates/ui-egui/src/ribbon.rs b/crates/ui-egui/src/ribbon.rs
+index d14724f1b..c13d0e8bc 100644
+--- a/crates/ui-egui/src/ribbon.rs
++++ b/crates/ui-egui/src/ribbon.rs
+@@ -262,11 +262,11 @@ fn file_menu(app: &mut SheetApp, ui: &mut Ui) {
+     }
+ }
+ 
+-/// System / Light / Dark, as in the View tab's Display theme box (`view.theme`).
++/// System / Desktop colors / Light / Dark, as in the View tab's Display theme box (`view.theme`).
+ fn theme_choices(app: &mut SheetApp, ui: &mut Ui) {
+     let lang = app.ui.language;
+     let mode = app.ui.theme_mode();
+-    for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")] {
++    for &(value, label) in crate::THEME_MODES {
+         if ui.radio(mode == value, lang.tr(label)).clicked() {
+             act(app, "view.theme", json!({"mode": value}));
+             ui.close();
+diff --git a/crates/ui-egui/src/ribbon/view.rs b/crates/ui-egui/src/ribbon/view.rs
+index 34fa582ea..3c35c807b 100644
+--- a/crates/ui-egui/src/ribbon/view.rs
++++ b/crates/ui-egui/src/ribbon/view.rs
+@@ -102,16 +102,12 @@ pub(super) fn view(app: &mut SheetApp, ui: &mut Ui) {
+     ui.vertical(|ui| {
+         let label_response = ui.label(lang.tr("Display theme"));
+         let mode = app.ui.theme_mode();
+-        let label = match mode {
+-            "system" => "System",
+-            "dark" => "Dark",
+-            _ => "Light",
+-        };
++        let label = crate::theme_mode_label(mode);
+         craft_ui::ComboBox::from_id_salt("display_theme")
+             .selected_text(lang.tr(label))
+             .width(88.0)
+             .show_ui(ui, |ui| {
+-                for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")] {
++                for &(value, label) in crate::THEME_MODES {
+                     if ui.selectable_label(mode == value, lang.tr(label)).clicked() {
+                         act(app, "view.theme", json!({"mode": value}));
+                     }
+diff --git a/crates/ui-egui/src/theme.rs b/crates/ui-egui/src/theme.rs
+index 9ebf19944..0c0d2b093 100644
+--- a/crates/ui-egui/src/theme.rs
++++ b/crates/ui-egui/src/theme.rs
+@@ -296,8 +296,111 @@ impl Tokens {
+         }
+     }
+ 
++    /// The colours on screen now: the desktop's palette when [`set_desktop_tokens`] installed one
++    /// for the light or dark style egui is drawing, and our own palette otherwise.
+     pub fn get(ctx: &egui::Context) -> Tokens {
+-        if ctx.global_style().visuals.dark_mode { Tokens::dark() } else { Tokens::light() }
++        let dark = ctx.global_style().visuals.dark_mode;
++        match desktop_tokens(ctx) {
++            Some(t) if t.dark == dark => t,
++            _ => Tokens::palette(dark),
++        }
++    }
++
++    /// The interface's colours made from the desktop's palette ("Desktop colors"). The chrome
++    /// (window, ribbon, tabs, menus, fields, panes, headers, status bar, the desk behind the pages)
++    /// takes the palette; the sheet and everything drawn on it keep our own colours, as do the
++    /// notice strips and the message box warning. Every colour that carries text or marks an edge
++    /// is pushed until it reaches the contrast `contrast_tests` holds our own palettes to,
++    /// whatever the theme gives.
++    pub fn from_desktop(p: &crate::desktop_palette::DesktopPalette) -> Tokens {
++        let base = Tokens::palette(p.dark);
++        let (bg, fg, d) = (p.background, p.foreground, p.dark);
++        // The extreme in the foreground's direction: what a colour moves to when the theme's own
++        // foreground isn't enough.
++        let ink = if d { Color32::WHITE } else { Color32::BLACK };
++        let white = |t: f32| mix(bg, Color32::WHITE, t);
++
++        let window = p.dark_background;
++        let ribbon = bg;
++        let tab_active = if d { mix(bg, fg, 0.08) } else { white(0.7) };
++        let menu_bg = if d { mix(bg, fg, 0.06) } else { white(0.6) };
++        let input_bg = if d { mix(bg, p.darker_background, 0.6) } else { white(0.7) };
++        let hover = mix(bg, fg, 0.08);
++        let pressed = mix(bg, fg, 0.15);
++        let accent_soft = mix(bg, p.accent, if d { 0.3 } else { 0.2 });
++        let header_bg = if d { mix(bg, p.darker_background, 0.3) } else { white(0.5) };
++        let header_sel_bg = mix(header_bg, fg, 0.12);
++        let surfaces = [window, ribbon, menu_bg, input_bg, tab_active, hover];
++        let text_on =
++            [window, ribbon, menu_bg, input_bg, tab_active, hover, pressed, accent_soft, base.notice_warn_bg, base.notice_info_bg, header_bg];
++
++        let text = readable(fg, &text_on, 4.5, &[ink]);
++        let text_dim = readable(mix(fg, bg, 0.35), &surfaces, 4.5, &[fg, ink]);
++
++        // Filled accent controls carry `on_accent`: as in our own palettes, light interfaces put
++        // white on a darker accent and dark ones a dark ink on a lighter one. The accent is also
++        // text on the window (File, contextual tabs) and a glyph on every surface.
++        let on_accent = if d { mix(p.darker_background, Color32::BLACK, 0.5) } else { Color32::WHITE };
++        let accent = readable(p.accent, &[on_accent, window], 4.5, &[ink]);
++        let mut glyph_on = surfaces.to_vec();
++        glyph_on.extend([pressed, accent_soft]);
++        let accent = readable(accent, &glyph_on, 3.0, &[ink]);
++        let accent_dark = mix(accent, Color32::BLACK, 0.2);
++        let header_sel_text = readable(if d { accent } else { accent_dark }, &[header_sel_bg], 4.5, &[ink]);
++
++        // Our own colours that sit on the chrome keep their hue, moved only as far as the themed
++        // surfaces need.
++        let fix = |c: Color32, on: &[Color32], ratio: f32| readable(c, on, ratio, &[ink]);
++        let s = base.syntax;
++        let on_input = [input_bg];
++        let syntax = Syntax {
++            keyword: fix(s.keyword, &on_input, 4.5),
++            string: fix(s.string, &on_input, 4.5),
++            number: fix(s.number, &on_input, 4.5),
++            comment: fix(s.comment, &on_input, 4.5),
++            builtin: fix(s.builtin, &on_input, 4.5),
++        };
++        let mut danger_on = surfaces.to_vec();
++        danger_on.push(window);
++        let cat_on = [ribbon, menu_bg, hover, pressed];
++
++        Tokens {
++            dark: d,
++            window,
++            ribbon,
++            ribbon_border: mix(bg, fg, 0.12),
++            text,
++            text_dim,
++            text_disabled: mix(fg, bg, 0.6),
++            accent,
++            accent_dark,
++            accent_soft,
++            hover,
++            pressed,
++            separator: mix(bg, fg, 0.14),
++            desk: p.darker_background,
++            header_bg,
++            header_text: readable(mix(fg, bg, 0.15), &[header_bg, header_sel_bg], 4.5, &[fg, ink]),
++            header_line: mix(header_bg, fg, 0.18),
++            header_sel_bg,
++            header_sel_text,
++            header_all_bg: mix(header_bg, accent, 0.25),
++            input_bg,
++            input_border: mix(bg, fg, 0.35),
++            tab_bar: window,
++            tab_active,
++            status_bar: window,
++            menu_bg,
++            danger: fix(base.danger, &danger_on, 4.5),
++            on_accent,
++            cat: base.cat.map(|c| fix(c, &cat_on, 3.0)),
++            ref_colors: base.ref_colors.map(|c| fix(c, &on_input, 4.5)),
++            syntax,
++            recording: fix(base.recording, &[ribbon, window], 3.0),
++            breakpoint: fix(base.breakpoint, &[window, accent_soft], 3.0),
++            badge_py: fix(base.badge_py, &[window, input_bg], 3.0),
++            ..base
++        }
+     }
+ 
+     /// One colour of the category palette.
+@@ -327,12 +430,86 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
+     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+ }
+ 
++/// Where [`set_desktop_tokens`] keeps the desktop palette's tokens.
++fn desktop_tokens_id() -> egui::Id {
++    egui::Id::unique("gridcraft-desktop-tokens")
++}
++
++/// The desktop palette's tokens, when [`set_desktop_tokens`] installed some.
++fn desktop_tokens(ctx: &egui::Context) -> Option<Tokens> {
++    ctx.data(|d| d.get_temp::<Tokens>(desktop_tokens_id()))
++}
++
++/// Draw the interface with `tokens` (made by [`Tokens::from_desktop`]) in place of our own palette
++/// of the same lightness, or with our own palettes again (`None`). The caller pins the theme to
++/// the palette's lightness.
++pub fn set_desktop_tokens(ctx: &egui::Context, tokens: Option<Tokens>) {
++    ctx.data_mut(|d| match tokens {
++        Some(t) => {
++            d.insert_temp(desktop_tokens_id(), t);
++        }
++        None => d.remove::<Tokens>(desktop_tokens_id()),
++    });
++    install_visuals(ctx);
++}
++
++/// `a` moved `t` (0–1) of the way to `b`, channel by channel.
++pub(crate) fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
++    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
++    let ch = |x: u8, y: u8| {
++        let v = f32::from(x) + (f32::from(y) - f32::from(x)) * t;
++        // In 0–255 by construction; the clamp keeps a rounding slip from wrapping.
++        v.round().clamp(0.0, 255.0) as u8
++    };
++    Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
++}
++
++/// `c`, or the least move from it toward each of `toward` in turn, that reaches `ratio` against
++/// every colour in `on`. When no move gets there, the last of `toward`.
++fn readable(c: Color32, on: &[Color32], ratio: f32, toward: &[Color32]) -> Color32 {
++    let reaches = |x: Color32| on.iter().all(|b| contrast(x, *b) >= ratio);
++    if reaches(c) {
++        return c;
++    }
++    for &target in toward {
++        for step in 1..=40u8 {
++            let x = mix(c, target, f32::from(step) / 40.0);
++            if reaches(x) {
++                return x;
++            }
++        }
++    }
++    toward.last().copied().unwrap_or(c)
++}
++
+ /// Installs light and dark token visuals in both theme slots, keeps the 2-3 px widget and 8-10 px window/menu corner radii from 0.36, and sets spacing, text styles and the active theme.
+ pub fn apply(ctx: &egui::Context, dark: bool) {
++    install_visuals(ctx);
++    ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
++    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
++    ctx.all_styles_mut(|s| {
++        s.spacing.item_spacing = egui::vec2(6.0, 4.0);
++        s.spacing.button_padding = egui::vec2(6.0, 3.0);
++        s.spacing.interact_size.y = 22.0;
++        s.text_styles.insert(egui::TextStyle::Body, ui_font(13.0));
++        s.text_styles.insert(egui::TextStyle::Button, ui_font(13.0));
++        s.text_styles.insert(egui::TextStyle::Small, ui_font(11.0));
++        s.text_styles.insert(egui::TextStyle::Heading, ui_bold(18.0));
++        s.text_styles.insert(egui::TextStyle::Monospace, FontId::new(12.0, FontFamily::Name(MONO.into())));
++    });
++}
++
++/// Both palettes' visuals in egui's two style slots: our own, or the desktop palette's in the slot
++/// of its lightness.
++fn install_visuals(ctx: &egui::Context) {
++    let desktop = desktop_tokens(ctx);
+     // Install both palettes before System can switch between the style slots.
+     for theme in [egui::Theme::Light, egui::Theme::Dark] {
+         let dark = theme == egui::Theme::Dark;
+-        let t = if dark { Tokens::dark() } else { Tokens::light() };
++        let t = match desktop {
++            Some(t) if t.dark == dark => t,
++            _ => Tokens::palette(dark),
++        };
+         let mut v = if dark { Visuals::dark() } else { Visuals::light() };
+         v.panel_fill = t.window;
+         v.window_fill = t.menu_bg;
+@@ -357,18 +534,6 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
+         v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: t.shadow };
+         ctx.set_visuals_of(theme, v);
+     }
+-    ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
+-    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+-    ctx.all_styles_mut(|s| {
+-        s.spacing.item_spacing = egui::vec2(6.0, 4.0);
+-        s.spacing.button_padding = egui::vec2(6.0, 3.0);
+-        s.spacing.interact_size.y = 22.0;
+-        s.text_styles.insert(egui::TextStyle::Body, ui_font(13.0));
+-        s.text_styles.insert(egui::TextStyle::Button, ui_font(13.0));
+-        s.text_styles.insert(egui::TextStyle::Small, ui_font(11.0));
+-        s.text_styles.insert(egui::TextStyle::Heading, ui_bold(18.0));
+-        s.text_styles.insert(egui::TextStyle::Monospace, FontId::new(12.0, FontFamily::Name(MONO.into())));
+-    });
+ }
+ 
+ /// Model colour → egui colour.
+@@ -480,6 +645,109 @@ mod contrast_tests {
+         assert!(failures.is_empty(), "contrast failures:\n{}", failures.join("\n"));
+     }
+ 
++    /// Made-up desktop palettes in the shape Omarchy writes, including awkward ones: a pale
++    /// accent on a light theme, a yellow one, pure black and white, and low contrast.
++    const DESKTOP_PALETTES: [&str; 8] = [
++        "mode = \"light\"\nbackground = \"#fbf5ee\"\ndark_background = \"#f0e7dc\"\ndarker_background = \"#e4d9cb\"\nforeground = \"#2e2925\"\naccent = \"#e0873f\"",
++        "mode = \"dark\"\nbackground = \"#1c1e26\"\ndark_background = \"#15171d\"\ndarker_background = \"#101116\"\nforeground = \"#b8bfd8\"\naccent = \"#82a4f5\"",
++        "mode = \"light\"\nbackground = \"#ffffff\"\ndark_background = \"#f4f4f4\"\ndarker_background = \"#e6e6e6\"\nforeground = \"#000000\"\naccent = \"#777777\"",
++        "mode = \"dark\"\nbackground = \"#000000\"\ndark_background = \"#080808\"\ndarker_background = \"#050505\"\nforeground = \"#ffffff\"\naccent = \"#909090\"",
++        "mode = \"dark\"\nbackground = \"#3a3f4b\"\ndark_background = \"#30343e\"\ndarker_background = \"#262a32\"\nforeground = \"#8a909c\"\naccent = \"#5f7da0\"",
++        "mode = \"dark\"\nbackground = \"#24221c\"\ndark_background = \"#1c1a15\"\ndarker_background = \"#14130f\"\nforeground = \"#e8e2c8\"\naccent = \"#f5e050\"",
++        "mode = \"light\"\nbackground = \"#fffef2\"\ndark_background = \"#f3f1de\"\ndarker_background = \"#e6e3cc\"\nforeground = \"#3a3a30\"\naccent = \"#f0e000\"",
++        "mode = \"light\"\nbackground = \"#d8dce4\"\ndark_background = \"#cdd2db\"\ndarker_background = \"#c2c7d1\"\nforeground = \"#6a7080\"\naccent = \"#2050c0\"",
++    ];
++
++    fn desktop_palettes() -> Vec<crate::desktop_palette::DesktopPalette> {
++        DESKTOP_PALETTES.iter().map(|text| crate::desktop_palette::parse(text).unwrap()).collect()
++    }
++
++    fn failures(name: &str, t: &Tokens) -> Vec<String> {
++        pairs(t)
++            .into_iter()
++            .filter_map(|(what, fg, bg, min)| {
++                let ratio = contrast(fg, bg);
++                (ratio < min).then(|| format!("{name}: {what} is {ratio:.2}:1, needs {min}:1"))
++            })
++            .collect()
++    }
++
++    /// Every pair our own palettes meet, an interface made from a desktop palette meets too,
++    /// however little contrast the palette itself has.
++    #[test]
++    fn desktop_palette_pairs_meet_wcag_contrast() {
++        let mut all = Vec::new();
++        for (i, p) in desktop_palettes().iter().enumerate() {
++            all.extend(failures(&format!("palette {i}"), &Tokens::from_desktop(p)));
++        }
++        assert!(all.is_empty(), "contrast failures:\n{}", all.join("\n"));
++    }
++
++    /// The desktop palette colours the chrome only: the sheet and what is drawn on it keep our
++    /// own colours, and the interface keeps the palette's lightness.
++    #[test]
++    fn desktop_palette_leaves_the_sheet_alone() {
++        for p in desktop_palettes() {
++            let (t, base) = (Tokens::from_desktop(&p), Tokens::palette(p.dark));
++            assert_eq!(t.dark, p.dark);
++            assert_eq!(
++                (t.grid_bg, t.gridline, t.cell_text, t.sel_fill, t.sel_border, t.active_row),
++                (base.grid_bg, base.gridline, base.cell_text, base.sel_fill, base.sel_border, base.active_row)
++            );
++            assert_eq!(t.sheet_ref_colors, base.sheet_ref_colors);
++            assert_eq!(
++                (t.sheet_control_bg, t.sheet_control_border, t.sheet_control_text, t.sheet_track, t.sheet_thumb),
++                (base.sheet_control_bg, base.sheet_control_border, base.sheet_control_text, base.sheet_track, base.sheet_thumb)
++            );
++            assert_eq!(
++                (t.sheet_fill, t.sheet_focus, t.sheet_py_tag, t.on_sheet_py_tag),
++                (base.sheet_fill, base.sheet_focus, base.sheet_py_tag, base.on_sheet_py_tag)
++            );
++            assert_eq!(
++                (t.sheet_macro_input, t.sheet_macro_footprint, t.sheet_macro_conflict, t.sheet_macro_target),
++                (base.sheet_macro_input, base.sheet_macro_footprint, base.sheet_macro_conflict, base.sheet_macro_target)
++            );
++            assert_eq!((t.sheet_trace_arrow, t.sheet_trace_error), (base.sheet_trace_arrow, base.sheet_trace_error));
++            assert_eq!((t.warning_fill, t.warning_ink, t.error_check_green), (base.warning_fill, base.warning_ink, base.error_check_green));
++        }
++    }
++
++    /// `Tokens::get` returns the desktop palette's colours while they are installed, for the
++    /// lightness they were made for, and our own once they are taken away.
++    #[test]
++    fn installed_desktop_tokens_are_what_the_interface_reads() {
++        let ctx = egui::Context::default();
++        let p = desktop_palettes()[0];
++        set_desktop_tokens(&ctx, Some(Tokens::from_desktop(&p)));
++        ctx.set_theme(egui::Theme::Light);
++        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
++        assert_eq!(Tokens::get(&ctx).ribbon, p.background);
++        assert_eq!(ctx.global_style().visuals.panel_fill, p.dark_background);
++        // Font setup re-applies the style; the desktop palette stays.
++        apply(&ctx, false);
++        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
++        assert_eq!(ctx.global_style().visuals.panel_fill, p.dark_background);
++        set_desktop_tokens(&ctx, None);
++        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
++        assert_eq!(Tokens::get(&ctx).ribbon, Tokens::light().ribbon);
++    }
++
++    /// Local check against real theme files: `GRIDCRAFT_DESKTOP_PALETTES=<dir>` runs every pair on
++    /// every `<dir>/*/colors.toml`. Without it this does nothing.
++    #[test]
++    fn desktop_palettes_from_a_folder_read() {
++        let Some(dir) = std::env::var_os("GRIDCRAFT_DESKTOP_PALETTES") else { return };
++        let (mut all, mut checked) = (Vec::new(), 0);
++        for entry in std::fs::read_dir(dir).unwrap().flatten() {
++            let Ok(text) = std::fs::read_to_string(entry.path().join("colors.toml")) else { continue };
++            let Some(p) = crate::desktop_palette::parse(&text) else { continue };
++            all.extend(failures(&entry.file_name().to_string_lossy(), &Tokens::from_desktop(&p)));
++            checked += 1;
++        }
++        println!("checked {checked} palettes");
++        assert!(all.is_empty(), "contrast failures:\n{}", all.join("\n"));
++    }
++
+     #[test]
+     fn contrast_matches_wcag_reference_values() {
+         assert!((contrast(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.01);
+-- 
+2.56.0
+
